@@ -1,39 +1,53 @@
 import numpy as np
 import tensorflow as tf
+from glob import glob
 from PIL import Image
+from vgg16 import VGG16
 from sklearn.utils import shuffle
 from skimage.io import imread, imshow
 from dl_layers import ActivationLayer, BatchNormalizationLayer, ConvolutionalLayer, ConvolutionalTransposeLayer
 
 
 class StyleBank(object):
-    def __init__(self, img_shape, n_styles, style_imgs_path, content_imgs_path):
+    def __init__(self, img_shape, style_imgs_path, content_imgs_path, style_loss_param):
         self.img_shape = img_shape
-        self.n_styles = n_styles
-        self.style_imgs_path = style_imgs_path
-        self.content_imgs_path = content_imgs_path
+        self.style_imgs = glob(style_imgs_path + '*')
+        self.content_imgs = glob(content_imgs_path + '*')
+        self.n_styles = len(self.style_imgs)
+        self.n_content_imgs = len(self.content_imgs)
+        self.style_loss_param = style_loss_param
         self.optimizer = None
 
         # auto-encoder
         self.encoder_layers = []
         self.decoder_layers = []
-        self.initialize_encoder()
 
         # style bank
         self.style_bank = {k: None for k in range(self.n_styles)}
-        self.initialize_style_bank()
 
         # operations
         self.reconstruct_op = None
         self.encoder_loss = None
         self.encoder_train_op = None
+        self.style_loss = None
+        self.content_loss = None
+        self.style_banks = None
 
         # other attributes
         self.session = None
         self.losses = None
 
-        # initialize the placeholder
-        self.tfX = tf.placeholder(shape=(None, *img_shape[1:]), dtype=tf.float32, name="tfX")
+        # placeholders - we need one for content and one for style
+        self.tfX = None
+        self.tfS = None
+        self.content_vgg = None
+        self.style_vgg = None
+        self.applied_styles = None
+
+    def initialize_placeholders(self):
+        # initialize the content and style image tensors
+        self.tfX = tf.placeholder(shape=(None, *self.img_shape[1:]), dtype=tf.float32, name="tfX")
+        self.tfS = tf.placeholder(shape=(None, *self.img_shape[1:]), dtype=tf.float32, name="tfS")
 
     def initialize_encoder(self):
         # initialize the encoder layers
@@ -106,9 +120,9 @@ class StyleBank(object):
                 ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=256, layer_id=0, padding="SAME"),
                 BatchNormalizationLayer(axes=[1, 2], beta=1),
                 ActivationLayer(tf.nn.relu),
-                ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=256, layer_id=0, padding="SAME"),
+                ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=self.encoder_layers[-1].output_shape[-1], layer_id=0, padding="SAME"),
                 BatchNormalizationLayer(axes=[1, 2], beta=1),
-                ActivationLayer(tf.nn.relu),
+                ActivationLayer(tf.nn.relu)
             ]
 
             # append the input shapes of each of the convolutional layers in the style bank
@@ -149,10 +163,95 @@ class StyleBank(object):
 
         return self.decode(z)
 
+    def forward_style_n(self, x, style_n):
+        z = self.encode(x)
+
+        for layer in self.style_bank[style_n]:
+            if isinstance(layer, BatchNormalizationLayer):
+                z = layer.forward(z, is_training=True)
+            else:
+                z = layer.forward(z)
+
+        z = self.decode(z)
+
+        return z
+
+    def sample_train_batch(self, batch_size, img_set):
+        if img_set == "content":
+            return np.random.choice(np.arange(0, self.n_content_imgs), size=batch_size, replace=False)
+
+        elif img_set == "style":
+            return np.random.choice(np.arange(0, self.n_styles), size=batch_size, replace=False)
+        else:
+            raise ValueError(
+                "Expected the 'img_set' parameter to be either 'content' or 'style', received '%s' instead." % img_set
+            )
+
+    def apply_style(self, c, indices):
+        return tf.concat(
+            [self.forward_style_n(tf.expand_dims(c[i], axis=0), style_n) for i, style_n in enumerate(indices)],
+            axis=0
+        )
+
+    def initialize_style_branch(self, c, s, style_indices, content_layer_n):
+        # apply the appropriate styles to the content images
+        z = self.apply_style(c, style_indices)
+        self.styled_content_vgg = self.initialize_vgg16(tf.shape(z), z)
+
+        # pass the content images through the VGG16 without applying any styles
+        self.content_vgg = self.initialize_vgg16(tf.shape(z), c)
+
+        # pass the style images through the VGG16
+        self.style_vgg = self.initialize_vgg16(tf.shape(s), s)
+
+        # initialize the style loss
+        self.initialize_style_loss()
+
+        # initialize the content loss
+        self.initialize_content_loss(content_layer_n)
+
+        # define the style branch loss
+        self.style_branch_loss = self.content_loss + self.style_loss_param * self.style_loss
+
+    def initialize_style_loss(self):
+        styled_content_outputs = [
+            tf.map_fn(self.gram_matrix, v) for k, v in self.styled_content_vgg.outputs.items() if k.endswith("conv2")
+        ]
+        style_outputs = [
+            tf.map_fn(self.gram_matrix, v) for k, v in self.style_vgg.outputs.items() if k.endswith("conv2")
+        ]
+
+        self.style_loss = 0
+        for content_grams, style_grams in zip(styled_content_outputs, style_outputs):
+            self.style_loss += tf.square(content_grams - style_grams)
+
+    def initialize_content_loss(self, content_layer_n):
+        conv_output_names = sorted([k for k, _ in self.styled_content_vgg.outputs.items() if "conv" in k])
+        layer_name = conv_output_names[content_layer_n]
+
+        self.content_loss = tf.square(
+            self.styled_content_vgg.outputs[layer_name] - self.content_vgg.outputs[layer_name]
+        )
+
+    @staticmethod
+    def gram_matrix(x):
+        z = tf.reshape(x, [-1, tf.shape(x)[-1]])  # this makes z [H*W, C]
+        z = tf.matmul(tf.transpose(z), z) / tf.constant(tf.reduce_prod(tf.shape(z)))
+
+        return z
+
+    @staticmethod
+    def initialize_vgg16(img_shape, input_tensor):
+        return VGG16(img_shape, input_tensor)
+
     def initialize_operations(self):
+        # encoder
         self.reconstruct_op = self.reconstruct(self.tfX)
         self.encoder_loss = tf.reduce_mean(tf.square(self.tfX - self.reconstruct_op))
         self.encoder_train_op = self.optimizer.minimize(self.encoder_loss)
+
+        # style bank
+        self.applied_styles = {i: self.apply_style(self.tfX, i) for i in range(self.n_styles)}
 
     def set_session(self):
         self.session = tf.Session()
@@ -168,8 +267,14 @@ class StyleBank(object):
         # create lists to hold loss
         self.losses = []
 
+        # initialize the auto-encoder and the style bank
+        self.initialize_encoder()
+        self.initialize_style_bank()
+
         # initialize operations
+        self.initialize_placeholders()
         self.initialize_operations()
+        self.initialize_style_branch()
 
         # initialize TF variables
         self.session.run(tf.global_variables_initializer())
@@ -202,23 +307,22 @@ class StyleBank(object):
 
 model = StyleBank(
     img_shape=(1, 459, 850, 3),
-    n_styles=None,
-    style_imgs_path=None,
-    content_imgs_path=None
+    style_imgs_path="./content/",
+    content_imgs_path="./style/"
 )
 
-x = Image.open("./content/Van_Gogh_-_Starry_Night.jpg")
-x = np.array(x)
+# x = Image.open("./style/Van_Gogh_-_Starry_Night.jpg")
+# x = np.array(x)
+#
+# # x = np.array(x.resize((850, 459)))
+# x = np.expand_dims(x, axis=0)
+#
+# model.fit(
+#     x,
+#     n_epochs=2000,
+#     batch_size=1
+# )
 
-# x = np.array(x.resize((850, 459)))
-x = np.expand_dims(x, axis=0)
-
-model.fit(
-    x,
-    n_epochs=2000,
-    batch_size=1
-)
-
-xr = model.session.run(model.reconstruct_op, feed_dict={model.tfX: x})
-xr = xr / xr.max()
-imshow(xr[0, ...])
+# xr = model.session.run(model.reconstruct_op, feed_dict={model.tfX: x})
+# xr = xr / xr.max()
+# imshow(xr[0, ...])
