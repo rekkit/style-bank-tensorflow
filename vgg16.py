@@ -1,56 +1,104 @@
 import numpy as np
 import tensorflow as tf
-import tempfile
+from dl_layers import ActivationLayer, ConvolutionalLayer, HiddenLayer, MaxPoolLayer
 
-RGB_MEAN_PIXELS = np.array([123.68, 116.779, 103.939]).reshape((1, 1, 1, 3)).astype(np.float32)
-DEFAULT_IMAGE_SHAPE = (None, 224, 224, 3)
-
+BGR_MEAN_PIXELS = np.array([103.939, 116.779, 123.68]).reshape((1, 1, 1, 3)).astype(np.float32)
 
 class VGG16:
-    """
-    A class that builds a TF graph with a pre-trained VGG16 model (on imagenet)
-    Also takes care of preprocessing. Input should be a regular RGB image (0-255)
-    """
-    def __init__(self, image_shape=DEFAULT_IMAGE_SHAPE, input_tensor=None):
-        self.image_shape = image_shape
-        self._build_graph(input_tensor)
+    def __init__(self, input_shape, trainable=True, session=None):
+        self.trainable = trainable
+        self.session = session
+        self.weights = None
+        self.params = []
 
-    def _build_graph(self, input_tensor):
-        with tf.Session() as sess:
-            with tf.variable_scope('VGG16'):
-                with tf.name_scope('inputs'):
-                    if input_tensor is None:
-                        input_tensor = tf.placeholder(tf.float32, shape=self.image_shape, name='input_img')
-                    else:
-                        pass  # assert self.image_shape == input_tensor.shape
-                    self.input_tensor = input_tensor
+        # VGG16 architecture
+        self.layers = [
+            # block 1
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=64, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=64, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            MaxPoolLayer(window_h=2, window_w=2, stride_horizontal=2, stride_vertical=2),
+            # block 2
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=128, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=128, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            MaxPoolLayer(window_h=2, window_w=2, stride_horizontal=2, stride_vertical=2),
+            # block 3
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=256, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=256, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=256, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            MaxPoolLayer(window_h=2, window_w=2, stride_horizontal=2, stride_vertical=2),
+            # block 4
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            MaxPoolLayer(window_h=2, window_w=2, stride_horizontal=2, stride_vertical=2),
+            # block 5
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            ConvolutionalLayer(filter_h=3, filter_w=3, maps_out=512, trainable=self.trainable, padding="SAME"),
+            ActivationLayer(tf.nn.relu),
+            MaxPoolLayer(window_h=2, window_w=2, stride_horizontal=2, stride_vertical=2),
+        ]
 
-                with tf.name_scope('preprocessing'):
-                    img = self.input_tensor - RGB_MEAN_PIXELS
-                    img = tf.reverse(img, axis=[-1])
+        self.layers[0].append_input_shape(input_shape=input_shape)
+        self.layers[0].initialize_weights(0)
+        self.params += [self.layers[0].w, self.layers[0].b]
+        for i in range(len(self.layers) - 1):
+            self.layers[i + 1].append_input_shape(
+                self.layers[i].output_shape
+            )
 
-                with tf.variable_scope('model'):
-                    self.vgg16 = tf.contrib.keras.applications.VGG16(
-                        weights='imagenet',
-                        include_top=False,
-                        input_tensor=img
-                    )
+            self.layers[i + 1].initialize_weights(i + 1)
 
-                    for layer in self.vgg16:
-                        layer.trainable = False
+            if isinstance(self.layers[i + 1], ConvolutionalLayer) or isinstance(self.layers[i + 1], HiddenLayer):
+                self.params += [self.layers[i + 1].w, self.layers[i + 1].b]
 
-                self.outputs = {l.name: l.output for l in self.vgg16.layers}
+    def load_weights(self, weights_path, session=None):
+        if self.session is None:
+            self.session = session
 
-            self.vgg_weights = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='VGG16/model')
+        if self.session is None:
+            raise ValueError(
+                "The session can not be None if you want to load weights."
+            )
 
-            with tempfile.NamedTemporaryFile() as f:
-                self.tf_checkpoint_path = tf.train.Saver(self.vgg_weights).save(sess, f.name)
+        self.weights = np.load(weights_path)
+        keys = sorted(self.weights.keys())
+        for i, k in enumerate(keys):
+            if i == len(self.params):
+                break
+            print(i, k, np.shape(self.weights[k]))
+            self.session.run(
+                self.params[i].assign(
+                    self.weights[k][:, :, ::-1, :] if (k.endswith("W") and i == 0) else self.weights[k]
+                )
+            )
 
-        self.model_weights_tensors = set(self.vgg_weights)
+    def forward_conv_output(self, x, layer_n, after_activation=True):
+        if layer_n < 1 or layer_n > 13:
+            raise ValueError(
+                "The VGG16 neural network has 13 convolution layers. Therefore the parameter 'layer' must be between "
+                "1 and 13."
+            )
 
-    def load_weights(self):
-        sess = tf.get_default_session()
-        tf.train.Saver(self.vgg_weights).restore(sess, self.tf_checkpoint_path)
-
-    def __getitem__(self, key):
-        return self.outputs[key]
+        i = 0
+        z = x
+        for j in range(len(self.layers)):
+            z = self.layers[j].forward(z)
+            if isinstance(self.layers[j], ConvolutionalLayer):
+                i += 1
+                if i == layer_n:
+                    if after_activation:
+                        z = self.layers[j+1].forward(z)
+                    return z
