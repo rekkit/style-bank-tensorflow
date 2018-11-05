@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 from glob import glob
 from vgg16 import VGG16
-from skimage.io import imread, imshow
+from skimage.io import imread, imshow, imsave
 from dl_layers import ActivationLayer, BatchNormalizationLayer, ConvolutionalLayer, ConvolutionalTransposeLayer
 
 
@@ -19,6 +19,7 @@ class StyleBank(object):
         self.optimizer = None
         self.config = tf.ConfigProto()
         self.config.gpu_options.allow_growth = True
+        self.first_fit = True
 
         # auto-encoder
         self.encoder_layers = []
@@ -33,13 +34,14 @@ class StyleBank(object):
         self.encoder_train_op = None
         self.style_loss = None
         self.content_loss = None
-        self.style_banks = None
         self.style_branch_train_op = None
 
         # other attributes
         self.session = None
         self.reconstruct_losses = None
+        self.style_branch_losses = None
         self.style_losses = None
+        self.content_losses = None
 
         # placeholders - we need one for content and one for style
         self.tfX = None
@@ -80,9 +82,7 @@ class StyleBank(object):
 
         # use the encoder layers to initialize the decoder layers
         self.decoder_layers = []
-        for i, encoder_layer in enumerate(
-                [layer for layer in self.encoder_layers[::-1] if isinstance(layer, ConvolutionalLayer)]
-        ):
+        for encoder_layer in [layer for layer in self.encoder_layers[::-1] if isinstance(layer, ConvolutionalLayer)]:
             self.decoder_layers.append(
                 ConvolutionalTransposeLayer(
                     filter_h=encoder_layer.filter_h,
@@ -96,6 +96,9 @@ class StyleBank(object):
 
             self.decoder_layers.append(BatchNormalizationLayer(axes=[1, 2], beta=1))
             self.decoder_layers.append(ActivationLayer(tf.nn.relu))
+
+        # we don't want instance normalization or activation in the last layer
+        self.decoder_layers = self.decoder_layers[:-2]
 
         # set the input shape of each of the decoder layers
         self.decoder_layers[0].append_input_shape(self.encoder_layers[-1].output_shape)
@@ -196,11 +199,13 @@ class StyleBank(object):
             axis=0
         )
 
-        return tf.gather_nd(z, style_indices)
+        z = tf.gather_nd(z, style_indices)
+
+        return z
 
     def initialize_style_branch(self, c, s, style_indices):
         # apply the appropriate styles to the content images
-        self.style_content_imgs_op = self.apply_styles(c, style_indices)
+        self.style_content_imgs_op = self.apply_styles(c, style_indices)  # self.forward_style_n(c, 0)
 
         # initialize the style loss
         self.initialize_style_loss(self.style_content_imgs_op, s)
@@ -209,16 +214,16 @@ class StyleBank(object):
         self.initialize_content_loss(self.style_content_imgs_op, c)
 
         # define the style branch loss
-        self.style_branch_loss = self.content_loss + self.style_loss_param * self.style_loss
+        self.style_branch_loss = self.style_loss + self.content_loss
 
     def initialize_style_loss(self, styled_c, s):
         styled_content_outputs = [
                 tf.map_fn(self.gram_matrix, self.vgg16.forward_conv_output(x=styled_c, layer_n=i)) for i in
-                [2, 4, 7, 10, 13]
+                [7, 8, 10, 13]
             ]
         style_outputs = [
                 tf.map_fn(self.gram_matrix, self.vgg16.forward_conv_output(x=s, layer_n=i)) for i in
-                [2, 4, 7, 10, 13]
+                [7, 8, 10, 13]
             ]
 
         self.style_loss = 0
@@ -226,6 +231,8 @@ class StyleBank(object):
             self.style_loss += tf.reduce_mean(
                 tf.square(content_grams - style_grams)
             )
+
+            self.style_loss = self.style_loss * self.style_loss_param
 
     def initialize_content_loss(self, styled_c, c):
         self.content_loss = tf.reduce_mean(
@@ -253,7 +260,21 @@ class StyleBank(object):
 
         # style bank
         self.initialize_style_branch(self.tfX, self.tfS, self.tfStyleIndices)
-        self.style_branch_train_op = self.optimizer.minimize(self.style_branch_loss)
+        style_vars = []
+        for style_n in self.style_bank:
+            style_vars += [
+                layer.w for layer in self.style_bank[style_n] if isinstance(layer, ConvolutionalLayer)
+            ]
+
+            style_vars += [
+                layer.b for layer in self.style_bank[style_n] if isinstance(layer, ConvolutionalLayer)
+            ]
+
+        # style cost / gradient clipping
+        gvs = self.optimizer.compute_gradients(self.style_branch_loss, var_list=style_vars)
+        capped_gvs = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gvs]
+        self.style_branch_train_op = self.optimizer.apply_gradients(capped_gvs)
+        #self.style_branch_train_op = self.optimizer.minimize(self.style_branch_loss)
 
     def set_session(self, session=None):
         if session is None:
@@ -261,26 +282,32 @@ class StyleBank(object):
         else:
             self.session = session
 
-    def fit(self, n_epochs, n_steps, batch_size, optimizer=None, print_step=20):
+    def fit(self, n_epochs, n_steps, batch_size, optimizer=None, print_step=20, resume_training=True):
         # set session and optimizer
-        self.set_session()
-        self.optimizer = optimizer if optimizer is not None else tf.train.AdamOptimizer()
+        if self.first_fit or not resume_training:
+            self.set_session()
+            self.optimizer = optimizer if optimizer is not None else tf.train.AdamOptimizer()
 
-        # create lists to hold loss
-        self.reconstruct_losses = []
-        self.style_losses = []
+            # create lists to hold loss
+            self.reconstruct_losses = []
+            self.style_branch_losses = []
+            self.content_losses = []
+            self.style_losses = []
 
-        # initialize the auto-encoder and the style bank
-        self.initialize_encoder()
-        self.initialize_style_bank()
+            # initialize the auto-encoder and the style bank
+            self.initialize_encoder()
+            self.initialize_style_bank()
 
-        # initialize operations
-        self.initialize_placeholders()
-        self.initialize_vgg16()
-        self.initialize_operations()
+            # initialize operations
+            self.initialize_placeholders()
+            self.initialize_vgg16()
+            self.initialize_operations()
 
-        # initialize TF variables
-        self.session.run(tf.global_variables_initializer())
+            # initialize TF variables
+            self.session.run(tf.global_variables_initializer())
+            self.vgg16.load_weights("./weights/vgg16_weights.npz", self.session)
+
+            self.first_fit = False
 
         # load the data into memory
         c = np.array([
@@ -299,9 +326,10 @@ class StyleBank(object):
 
                 c_batch = c[c_i]
                 s_batch = s[s_i]
-                style_indices = [
+
+                style_indices = np.array([
                     [style_n, k] for k, style_n in enumerate(s_i)
-                ]
+                ])
 
                 # style branch training
                 self.session.run(
@@ -324,17 +352,38 @@ class StyleBank(object):
                     )
                 )
 
-                self.style_losses.append(
+                self.style_branch_losses.append(
                     self.session.run(
-                        self.style_loss,
-                        feed_dict={self.tfX: c_batch, self.tfS: s_batch, self.tfStyleIndices: style_indices}
+                        self.style_branch_loss,
+                        feed_dict={self.tfX: c_batch, self.tfS: s_batch, self.tfStyleIndices: [[0, 0]]}
                     )
                 )
 
-                print("Epoch: %d. Reconstruct loss: %.2f. Style loss: %.2f." % (
-                        i, self.reconstruct_losses[-1], self.style_losses[-1]
+                self.style_losses.append(
+                    self.session.run(
+                        self.style_loss,
+                        feed_dict={self.tfX: c_batch, self.tfS: s_batch, self.tfStyleIndices: [[0, 0]]}
                     )
                 )
+
+                self.content_losses.append(
+                    self.session.run(
+                        self.content_loss,
+                        feed_dict={self.tfX: c_batch, self.tfS: s_batch, self.tfStyleIndices: [[0, 0]]}
+                    )
+                )
+
+                print("Epoch: %d. Reconstruct loss: %.2f. Style branch loss: %.2f. Style loss: %.2f. Content loss: %.2f." % (
+                        i,
+                        self.reconstruct_losses[-1],
+                        self.style_branch_losses[-1],
+                        self.style_losses[-1],
+                        self.content_losses[-1]
+                    )
+                )
+
+            if len(self.style_losses) > 0 and self.style_losses[-1] <= 250:
+                break
 
 
 model = StyleBank(
@@ -342,24 +391,35 @@ model = StyleBank(
     content_shape=(1, 1014, 1280, 3),
     style_imgs_path="./style/",
     content_imgs_path="./content/",
-    style_loss_param=1000,
-    content_layer_n=5
+    style_loss_param=50,
+    content_layer_n=3
 )
 
 model.fit(
-    n_epochs=400,
+    n_epochs=15000,
     n_steps=3,
-    batch_size=1
+    batch_size=1,
+    optimizer=tf.train.AdamOptimizer(learning_rate=.00001),
+    print_step=10
 )
 
 img = imread("./content/The-Grand-Belgrade-Fortress-and-Park-Kalemegdan.jpg")
+img = np.expand_dims(img, axis=0)
+style_img = imread("./style/Van_Gogh_-_Starry_Night.jpg")
+
+# using gather
 imgr = model.session.run(
     model.style_content_imgs_op,
-    feed_dict={model.tfX: np.expand_dims(img, axis=0), model.tfStyleIndices: [[0, 0]]}
+    feed_dict={
+        model.tfX: img,
+        model.tfS: np.expand_dims(style_img, axis=0),
+        model.tfStyleIndices: [[0, 0]]
+    }
 )
-imgr = imgr[0] / imgr.max()
+imgr = imgr[0] - imgr.min()
+imgr = imgr / imgr.max()
 imshow(imgr)
 
-# xr = model.session.run(model.reconstruct_op, feed_dict={model.tfX: x})
-# xr = xr / xr.max()
-# imshow(xr[0, ...])
+xr = model.session.run(model.reconstruct_op, feed_dict={model.tfX: img})
+xr = xr / xr.max()
+imshow(xr[0, ...])

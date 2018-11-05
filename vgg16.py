@@ -2,7 +2,6 @@ import numpy as np
 import tensorflow as tf
 from dl_layers import ActivationLayer, ConvolutionalLayer, HiddenLayer, MaxPoolLayer
 
-BGR_MEAN_PIXELS = np.array([103.939, 116.779, 123.68]).reshape((1, 1, 1, 3)).astype(np.float32)
 
 class VGG16:
     def __init__(self, input_shape, trainable=True, session=None):
@@ -10,6 +9,7 @@ class VGG16:
         self.session = session
         self.weights = None
         self.params = []
+        self.BGR_MEAN_PIXELS = np.array([103.939, 116.779, 123.68]).reshape((1, 1, 1, 3)).astype(np.float32)
 
         # VGG16 architecture
         self.layers = [
@@ -93,7 +93,7 @@ class VGG16:
             )
 
         i = 0
-        z = x
+        z = x[:, :, :, ::-1] - self.BGR_MEAN_PIXELS
         for j in range(len(self.layers)):
             z = self.layers[j].forward(z)
             if isinstance(self.layers[j], ConvolutionalLayer):
