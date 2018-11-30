@@ -1,5 +1,6 @@
 import numpy as np
 import tensorflow as tf
+from tensorflow.contrib.layers import instance_norm
 
 
 class ActivationLayer:
@@ -28,9 +29,9 @@ class FlattenLayer:
     def append_input_shape(self, input_shape):
         self.input_shape = input_shape
         if None in self.input_shape[1:]:
-            self.output_shape = [self.input_shape[0], None]
+            self.output_shape = (self.input_shape[0], None)
         else:
-            self.output_shape = [self.input_shape[0], np.prod(self.input_shape[1:])]
+            self.output_shape = (self.input_shape[0], np.prod(self.input_shape[1:]))
 
     def initialize_weights(self, layer_id):
         pass
@@ -67,7 +68,7 @@ class MaxPoolLayer:
                 (self.input_shape[2] - self.window_w) / self.stride_horizontal + 1
             ) if self.input_shape[2] is not None else None
 
-            self.output_shape = [self.input_shape[0], output_h, output_w, self.input_shape[-1]]
+            self.output_shape = (self.input_shape[0], output_h, output_w, self.input_shape[-1])
 
     def initialize_weights(self, layer_id):
         pass
@@ -121,7 +122,7 @@ class HiddenLayer:
 
             self.input_shape = input_shape
             self.n_in = self.input_shape[1]
-            self.output_shape = [input_shape[0], self.n_out]
+            self.output_shape = (input_shape[0], self.n_out)
 
         def forward(self, x):
             """
@@ -132,8 +133,32 @@ class HiddenLayer:
             return tf.matmul(x, self.w) + self.b
 
 
+class InstanceNormalizationLayer:
+    def __init__(self, trainable=True):
+        self.input_shape = None
+        self.output_shape = None
+        self.trainable = trainable
+
+    def append_input_shape(self, input_shape):
+        self.input_shape = input_shape
+        self.output_shape = input_shape
+
+    def initialize_weights(self, layer_id):
+        pass
+
+    @staticmethod
+    def forward(x, is_training):
+        return instance_norm(
+            x,
+            center=True,
+            scale=True,
+            epsilon=1e-06,
+            trainable=is_training
+        )
+
+
 class BatchNormalizationLayer:
-    def __init__(self, axes=[0, 1, 2], beta=0.9, trainable=True):
+    def __init__(self, axes=[0, 1, 2], beta=0.1, trainable=True):
         self.n_channels = None
         self.mean = None
         self.var = None
@@ -168,8 +193,8 @@ class BatchNormalizationLayer:
             )
 
             # calculate the exponential weighted moving average of the mean and variance
-            self.mean = self.beta * self.mean + (1 - self.beta) * batch_mean
-            self.var = self.beta * self.var + (1 - self.beta) * batch_var
+            self.mean = (1 - self.beta) * self.mean + self.beta * batch_mean
+            self.var = (1 - self.beta) * self.var + self.beta * batch_var
 
         # normalize the input
         return tf.nn.batch_normalization(
@@ -256,7 +281,7 @@ class ConvolutionalLayer:
                 (self.input_shape[2] - self.filter_w) / self.stride_horizontal + 1
             ) if self.input_shape[2] is not None else None
 
-            self.output_shape = [self.input_shape[0], output_h, output_w, self.maps_out]
+            self.output_shape = (self.input_shape[0], output_h, output_w, self.maps_out)
 
     def forward(self, x):
         z = tf.nn.conv2d(
@@ -346,7 +371,7 @@ class ConvolutionalTransposeLayer:
         z = tf.nn.conv2d_transpose(
             x,
             filter=self.w,
-            output_shape=self.output_shape,
+            output_shape=(tf.shape(x)[0], *self.output_shape[1:]),
             strides=[1, self.stride_vertical, self.stride_horizontal, 1],
             padding=self.padding
         )
